@@ -54,6 +54,10 @@ const META = [
   { name: "逐层回答", keys: ["第 4 层"] },
   { name: "禁用词表", keys: ["我不能", "抱歉", "I can't"] },
   { name: "会话持久", keys: ["轮次独立", "不削弱"] },
+  // provider 输出侧分类器拒答是独立故障，提示词层只能改输出形状
+  { name: "输出侧过滤", keys: ["输出侧过滤器", "content_filter", "分片", "同义重发"] },
+  // 多模态分类器：实测图片张数是独立拦截维度，与措辞/上下文长度无关
+  { name: "多模态预算", keys: ["多模态", "读图", "张"] },
 ];
 
 const score = (text, keys) => keys.filter((k) => text.includes(k)).length;

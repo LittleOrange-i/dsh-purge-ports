@@ -7,7 +7,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 let failed = 0;
@@ -31,7 +31,7 @@ for (const f of [
   "package.json",
   ".codebuddy-plugin/marketplace.json",
   "plugins/purge-workbuddy/.codebuddy-plugin/plugin.json",
-  ".zcode-plugin/marketplace.json",
+  "marketplace.json",
   "plugins/purge-zcode/.zcode-plugin/plugin.json",
   "plugins/purge-zcode/hooks/hooks.json",
 ]) {
@@ -99,8 +99,131 @@ try {
 try {
   const evalOut = execFileSync(process.execPath, [path.join(ROOT, "scripts/eval.mjs")], { encoding: "utf8" });
   ok("覆盖率评测全部预设达标", evalOut.includes("全部预设达标"));
+  ok("评测含输出侧过滤器能力项", /输出侧过滤/.test(evalOut));
 } catch (e) {
   ok("覆盖率评测", false, (e.stdout || e.message).slice(-200));
+}
+
+// 输出侧过滤器协议：三份源都必须带，否则 content_filter 复发时规则层帮不上
+try {
+  for (const rel of ["presets/default.md", "presets/lite.md", "presets/terse.md"]) {
+    const text = fs.readFileSync(path.join(ROOT, rel), "utf8");
+    ok(`${rel} 含输出侧协议`, text.includes("输出侧过滤器") && text.includes("同义重发"));
+  }
+} catch (e) {
+  ok("输出侧协议", false, e.message);
+}
+
+// diag / rearm：日志不存在时也要给出可读输出，不能抛
+try {
+  const fakeHome = path.join(tmp, "diaghome");
+  fs.mkdirSync(fakeHome, { recursive: true });
+  const env = { ...process.env, USERPROFILE: fakeHome, HOME: fakeHome };
+  const runHome = (...args) => execFileSync(process.execPath, [cli, ...args], { encoding: "utf8", env });
+
+  const emptyDiag = runHome("diag");
+  ok("diag 无日志时正常退出", emptyDiag.includes("没扫到失败记录"));
+
+  // 造两份日志：一份 content_filter + 网关 502，验证分类不混
+  const logDir = path.join(fakeHome, ".zcode", "cli", "log");
+  fs.mkdirSync(logDir, { recursive: true });
+  const now = new Date().toISOString();
+  fs.writeFileSync(
+    path.join(logDir, "zcode-2099-01-01.jsonl"),
+    [
+      JSON.stringify({ timestamp: now, event: "model.runtime.stream.content_filtered", traceId: "T1", sessionId: "s", providerId: "p", modelId: "m", reason: "content_filter" }),
+      JSON.stringify({ timestamp: now, event: "turn.failed", traceId: "T1", sessionId: "s", error: { message: "Model output was blocked by the provider's content safety filter." } }),
+      JSON.stringify({ timestamp: now, event: "model.request.failed", traceId: "T2", providerId: "gw", statusCode: 502, statusMessage: "codearts_protocol" }),
+    ].join("\n"),
+    "utf8",
+  );
+  const diagOut = runHome("diag");
+  ok("diag 认出输出过滤器", diagOut.includes("输出侧过滤器"));
+  ok("diag 认出网关 502", diagOut.includes("本地网关空回答"));
+  ok("diag 判定两条故障链", diagOut.includes("两条独立故障链"));
+  ok("diag --trace 可过滤", runHome("diag", "--trace", "T2").includes("T2"));
+  ok("rearm --dry-run 可运行", runHome("rearm", "--dry-run").includes("下一步"));
+  ok("diag 无 rollout 时正常退出", runHome("diag", "--images").includes("判定"));
+
+  // vision：伪造两个月 rollout 记录，验证「图片张数 vs 被拦」的列联表算得对
+  const rollDir = path.join(fakeHome, ".zcode", "cli", "rollout");
+  fs.mkdirSync(rollDir, { recursive: true });
+  const mk = (imgCount, finishReason, at) =>
+    JSON.stringify({
+      startedAt: at,
+      request: { body: { messages: [{ role: "user", content: Array.from({ length: imgCount }, () => ({ type: "image", source: { type: "base64", media_type: "image/png", data: "x" } })) }] } },
+      response: { finishReason, modelId: "m" },
+    });
+  fs.writeFileSync(
+    path.join(rollDir, "model-io-sess_v.jsonl"),
+    [
+      mk(0, "stop", now),
+      mk(0, "tool-calls", now),
+      mk(3, "stop", now),
+      mk(4, "content-filter", now),
+      mk(5, "content-filter", now),
+    ].join("\n"),
+    "utf8",
+  );
+  const visionOut = runHome("vision");
+  ok("vision 打出列联表", visionOut.includes("列联表") && visionOut.includes("拦截率"));
+  ok("vision 判出纯文本 0 命中", visionOut.includes("纯文本请求 0 次被拦"));
+  ok("vision 标出超预算行", visionOut.includes("超预算"));
+  ok("diag --images 带图像归因", runHome("diag", "--images").includes("按单次请求的图片张数归因"));
+} catch (e) {
+  ok("diag / rearm", false, e.message);
+}
+
+// relay：六条处置通道各跑一遍（假上游按形状分别应答）
+try {
+  const relayOut = run("relay", "--selftest");
+  const r = JSON.parse(relayOut);
+  ok("relay 自检全通", r.ok === true);
+  const byName = Object.fromEntries((r.results || []).map((x) => [x.name, x]));
+  ok("relay 拆段合并可用", Boolean(byName["拆段合并"]?.ok), byName["拆段合并"]?.detail);
+  ok("relay 图像预算降载", Boolean(byName["图像预算降载"]?.ok), byName["图像预算降载"]?.detail);
+  ok("relay 软拒绝纠正", Boolean(byName["软拒绝纠正"]?.ok), byName["软拒绝纠正"]?.detail);
+  ok("relay 被拦形状识别", Boolean(byName["被拦形状识别"]?.ok), byName["被拦形状识别"]?.detail);
+  ok("relay 拒绝句式识别", Boolean(byName["拒绝句式识别"]?.ok), byName["拒绝句式识别"]?.detail);
+  ok("relay 拆段指令带序号", Boolean(byName["拆段指令"]?.ok));
+
+  const mod = await import(pathToFileURL(path.join(ROOT, "core/relay.mjs")).href);
+  ok("relay 认出 OpenAI content_filter", mod.isBlocked({ choices: [{ finish_reason: "content_filter", message: { content: "" } }] }));
+  ok("relay 认出 Anthropic refusal", mod.isBlocked({ stop_reason: "refusal", content: [] }));
+  ok("relay 不误判正常回复", !mod.isBlocked({ choices: [{ finish_reason: "stop", message: { content: "ok" } }] }));
+
+  // 图像预算常量与扫描：3 张以内不动，超了才降载
+  ok("relay 默认图像预算为 3", mod.IMAGE_BUDGET === 3);
+  const fiveImgs = {
+    messages: [{ role: "user", content: Array.from({ length: 5 }, () => ({ type: "image", source: { media_type: "image/png", data: "A".repeat(50) } })) }],
+  };
+  const report = mod.visionReport(fiveImgs);
+  ok("relay 数得出 5 张图", report.images === 5 && report.over === true, `images=${report.images} over=${report.over}`);
+  const reduced = mod.applyImageBudget(fiveImgs, 3);
+  const after = mod.scanImages(reduced.body).length;
+  ok("relay 降载后剩 3 张", after === 3 && reduced.stripped === 2, `after=${after} stripped=${reduced.stripped}`);
+
+  // tool_result 内嵌图片也要能被数到（ZCode 的读图结果就是这种形状）
+  const nested = {
+    messages: [
+      { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "Read", input: { file_path: "C:/shots/01.png" } }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: [{ type: "image", source: { media_type: "image/png", data: "B".repeat(40) } }] }] },
+    ],
+  };
+  const nestedImgs = mod.scanImages(nested);
+  ok("relay 数得到 tool_result 内嵌图", nestedImgs.length === 1 && nestedImgs[0].path.includes("01.png"), nestedImgs[0]?.path || "");
+} catch (e) {
+  ok("relay", false, e.message);
+}
+
+// 多模态预算：三份规则源都要带这条（否则读多张图时没人提醒）
+for (const [rel, file] of [
+  ["full", "core/prompt.zh.md"],
+  ["lite", "core/prompt.lite.md"],
+  ["terse", "presets/terse.md"],
+]) {
+  const text = fs.readFileSync(path.join(ROOT, file), "utf8");
+  ok(`${rel} 含多模态预算`, text.includes("多模态") && /3 张|≤3|不超过 3/.test(text));
 }
 
 // 预设体系

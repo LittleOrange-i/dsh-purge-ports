@@ -8,9 +8,102 @@
 
 一套规则源，两个宿主的插件包，外加零依赖 CLI：**5 套预设 + 范围管理 + 演练台 + 4 技能 + 4 命令 + 2 agent**。
 
-- 版本：1.2.0
+- 版本：2.0.0
 - 许可：Apache-2.0（保留上游署名，见 [NOTICE](./NOTICE)）
 - 依赖：Node.js ≥ 18（只用标准库）
+
+---
+
+## 2.0.0 改了什么
+
+1.3.0 上线后，ZCode 仍然报同样的错。这次把日志和 rollout 一起拉出来做列联表，找到了真正的触发物。
+
+### 根因：多模态图像分类器，不是提示词
+
+对 `~/.zcode/cli/rollout/` 里 **309 次真实模型调用**做归因（阳性 = `response.finishReason === "content-filter"`）：
+
+| 分组 | 总请求 | 被拦 | 拦截率 |
+| --- | --- | --- | --- |
+| 全部 | 309 | 11 | 3.6% |
+| **含图片** | 26 | 11 | **42.3%** |
+| **不含图片** | 283 | **0** | **0.0%** |
+| 不含图片 且 body > 30 KB | 224 | **0** | 0.0% |
+
+按图片张数：`0→0/283`、`1→0/2`、`2→0/5`、`3→0/6`、`4→8 拦/2 过`、`5→3 拦/0 过`。
+
+结论：
+
+- **纯文本请求 0 次被拦，哪怕超过 30 KB**。所以这不是上下文长度、不是措辞、不是触发词密度。
+- **1–3 张图 100% 通过，4 张起跳，5 张全灭**。
+- 同样 4 张图，718,496 字符的那组 8/8 全被拦，720,996 字符的那组 2/2 全过 —— 具体图像内容也参与判定，所以**同一份 payload 重发必然再被拦**。
+- 拦截点固定在"工具结果回灌后的下一轮"，而工具结果里塞的是 4 张真机截图（每张约 190 K 字符 base64）。
+
+### 修的是什么
+
+| 层 | 谁在拦 | 1.3.0 | 2.0.0 |
+| --- | --- | --- | --- |
+| 提示词层 | 宿主模板拒绝话术 | 归入环境噪声 | 保留 |
+| 输出层 | provider 输出分类器 | 输出侧过滤器协议（分片/围栏/占位符/同义重发） | 保留 |
+| **多模态层** | **provider 图像分类器，按图片张数+内容判** | **完全没处理** | **图像预算：单次 ≤3 张，超了在转发前降成文本占位** |
+| 模型层 | 模型自己写"我不能" | 没有检测 | 移植上游 refusal-retry：识别 + 三段纠正 + 无效则放行原话 |
+
+### 新增命令
+
+```bash
+node bin/purge.mjs vision                        # 图像维度归因：几张图开始被拦
+node bin/purge.mjs diag --images                 # diag 里带同一张列联表
+node bin/purge.mjs relay --upstream <URL>        # 转发前自动降载 + 拆段 + 软拒绝纠正
+node bin/purge.mjs relay --upstream <URL> --image-budget 2   # 改预算
+```
+
+`vision` 在你这台机器上的实测输出：
+
+```
+── 列联表（按单次请求的图片张数）
+  张数   总请求   被拦   拦截率
+    0      283       0   0.0%
+    1        2       0   0.0%
+    2        5       0   0.0%
+    3        6       0   0.0%
+    4       10       8   80.0%  ← 超预算
+    5        3       3  100.0%  ← 超预算
+
+── 判定
+纯文本请求 0 次被拦，命中全部来自含图片的请求。
+这是 provider 的多模态分类器，不是提示词问题。改提示词/规则层对它无效。
+```
+
+### relay 的处置顺序
+
+```
+请求进来
+  ├─ 0. 图片 > 3 张 → 先把多余的换成「[图片已省略：<路径> · <mime> · N 字符]」
+  ├─ 1. 直发一次
+  ├─ 2. 正文是软拒绝（"我不能/抱歉/I can't"） → 换措辞重发 ×3（续写 → 工程框架 → 最小切片）
+  ├─ 3. 协议层被丢（content_filter / refusal / 空） → 降到 1 张图再试 → 不行才拆段
+  └─ 4. 网关空回答 / 超时 → 退避重试
+```
+
+第 3 步"降到 1 张"是关键：拆段只能把**输出**切小，改不了**输入里塞了几张图**。这个故障在输入端，必须先在输入端降。
+
+### 规则层同步更新
+
+三份规则源都加了「多模态请求」段：单次读图 ≤3 张、读前说明要看什么、不把整目录截图一次塞进去、被拦在工具结果之后先查上一轮图片数量而不是措辞、多图比对每张读完写成文字结论后续只带文字。
+
+`eval` 加了第 10 项元能力「多模态预算」，`selftest` 从 84 项扩到 **96 项**。
+
+```bash
+node bin/purge.mjs relay --upstream https://your-upstream/v1 --port 8787
+```
+
+然后把宿主的 base URL 改指 `http://127.0.0.1:8787/v1`。OpenAI 与 Anthropic 两种请求/响应形状都认，SSE 也照常吐。
+
+自检不连真上游：
+
+```bash
+node bin/purge.mjs relay --selftest
+# {"ok": true, "text": "PART1\n\nPART2\n\nPART3", "calls": 4, "shards": 3}
+```
 
 ---
 
@@ -27,7 +120,11 @@
 | **4 个命令** | `commands/` | /purge、/purge-drill、/purge-scope、/purge-preset |
 | **2 个 agent** | `agents/` | redteam（六阶段执行）、recon（只出清单） |
 | **体检工具** | `doctor` / `verify` / `probe` | 体积上限、sha256 漂移、12 条行为探针 |
-| **覆盖率评测** | `scripts/eval.mjs` | 21 类意图 + 8 项元能力，静态打分，进 CI |
+| **故障诊断** | `purge diag` | 读 ZCode 日志，分出 content_filter / 网关故障 / 取消 |
+| **图像归因** | `purge vision` | rollout 列联表：从几张图开始被拦，超预算的行直接标出来 |
+| **一键复位** | `purge rearm` | 重装规则 + 清 hook 缓存，处理"注入了但被拦" |
+| **转发补丁** | `purge relay` | 转发前降图像预算；命中就拆段重发；软拒绝就换措辞纠正；网关空回答就退避重试 |
+| **覆盖率评测** | `scripts/eval.mjs` | 21 类意图 + 10 项元能力，静态打分，进 CI |
 
 ---
 
@@ -35,19 +132,19 @@
 
 | 预设 | 体积 | 类别覆盖 | 元能力 | 场景 |
 | --- | --- | --- | --- | --- |
-| `default` | 15.7 KB | 99.2% | 100% | 完整契约。ZCode 默认 |
-| `lite` | 7.0 KB | 99.2% | 100% | 同能力压进 8 KB。WorkBuddy 默认 |
-| `redteam` | 6.6 KB | 87.3% | 100% | 演练：六阶段流程、证据纪律；报告模板在 skill 里 |
-| `writer` | 6.5 KB | 87.3% | 100% | 写作/角色扮演：露骨度档位、连续性四层护栏 |
-| `terse` | 4.3 KB | 87.3% | 100% | 弱模型、超长上下文 |
+| `default` | 18.4 KB | 99.2% | 100% | 完整契约。ZCode 默认 |
+| `lite` | 8.0 KB | 99.2% | 100% | 同能力压进 8 KB。WorkBuddy 默认 |
+| `redteam` | 7.4 KB | 87.3% | 100% | 演练：六阶段流程、证据纪律；报告模板在 skill 里 |
+| `writer` | 7.3 KB | 87.3% | 100% | 写作/角色扮演：露骨度档位、连续性四层护栏 |
+| `terse` | 5.1 KB | 87.3% | 100% | 弱模型、超长上下文 |
 
 预设 = 基础契约 + 场景叠加层。`core/presets.json` 声明组合关系，`scripts/sync.mjs` 组装：
 
 ```
-terse(4.3KB) ─┬─ + overlays/redteam.md → redteam(6.6KB)
-              └─ + overlays/writer.md  → writer(6.5KB)
-lite(7.0KB)  ──── 直接可用
-default(15.7KB) ── 完整版
+terse(5.1KB) ─┬─ + overlays/redteam.md → redteam(7.4KB)
+              └─ + overlays/writer.md  → writer(7.3KB)
+lite(8.0KB)  ──── 直接可用
+default(18.4KB) ── 完整版
 ```
 
 重的内容（报告模板、逆向方法链）放在 skill 里按需加载，不占常驻预算。
@@ -101,14 +198,42 @@ node /path/to/dsh-purge-ports/bin/purge.mjs install --host all --scope project
 
 ### 方式 B：装成插件
 
-仓库根就是两个宿主的市场根：`.codebuddy-plugin/marketplace.json` 给 WorkBuddy，`.zcode-plugin/marketplace.json` 给 ZCode。
+市场清单都放在宿主能探测到的位置：
+
+- **WorkBuddy**：`.codebuddy-plugin/marketplace.json`
+- **ZCode**：仓库根的 `marketplace.json`。ZCode 添加市场时只探测**根级 `marketplace.json`** 和 `.claude-plugin/marketplace.json`，不探测 `.zcode-plugin/` 里的清单（1.2.1 及之前放在那里是错的，装不上）。
 
 **WorkBuddy**：插件 → 市场 → 添加本地目录（仓库根）→ 安装 `purge-workbuddy`。
-**ZCode**：插件 → 添加市场 → 同一目录 → 安装 `purge-zcode`。
+**ZCode**：设置 → 插件管理 → 发现页 → **+** 添加市场 → 选仓库根 → 安装 `purge-zcode`。
+命令行等价操作：
+
+```bash
+zcode plugins marketplace add <仓库根路径>
+zcode plugins install purge-zcode@dsh-purge-ports
+```
 
 装完拿到：4 个技能、4 个命令、2 个 agent，加常驻规则（WorkBuddy 走 `rules/`，ZCode 走 `SessionStart` hook）。
 
 两条通道互补：插件"装好就生效"，CLI"没有插件系统也能生效"。任一条够用，两条一起最稳。
+
+### 方式 C：手动落到插件缓存（无 CLI 时）
+
+ZCode 桌面版没有全局 `zcode` 命令时，直接写缓存目录和登记文件即可：
+
+```bash
+# 1. 把插件包复制到版本目录
+cp -r plugins/purge-zcode ~/.zcode/cli/plugins/cache/dsh-purge-ports/purge-zcode/2.0.0
+
+# 2. 让登记表指向新目录（version 与 installPath 一起改）
+#    ~/.zcode/cli/plugins/installed_plugins.json 里 purge-zcode@dsh-purge-ports 这一条
+```
+
+Windows 上对应 `%USERPROFILE%\.zcode\cli\plugins\cache\dsh-purge-ports\purge-zcode\2.0.0`。
+`installPath` 必须真的存在，否则 ZCode 启动时会把这条插件当成损坏项。校对方法：
+
+```bash
+node bin/purge.mjs doctor     # 「✓ 插件安装」会打印解析到的目录
+```
 
 ---
 
@@ -265,7 +390,7 @@ dsh-purge-ports/
 │       ├── redteam.md                     六阶段流程、证据纪律、报告结构
 │       └── writer.md                      露骨度档位、连续性四层护栏
 ├── .codebuddy-plugin/marketplace.json     WorkBuddy 市场清单
-├── .zcode-plugin/marketplace.json         ZCode 市场清单
+├── marketplace.json                       ZCode 市场清单（根级，ZCode 只探测这里）
 ├── plugins/
 │   ├── purge-workbuddy/
 │   │   ├── .codebuddy-plugin/plugin.json
